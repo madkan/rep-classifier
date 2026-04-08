@@ -1,0 +1,16 @@
+{
+  "idf.flashType": "UART",
+  "idf.port": "/dev/tty.usbserial-210",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "/Users/avasokolosky/.espressif/tools/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=/Users/avasokolosky/.espressif/tools/tools/xtensa-esp-elf/esp-14.2.0_20251107/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc",
+    "--compile-commands-dir=/Users/avasokolosky/Desktop/CS 528/FINAL_PROJECT/build"
+  ]
+}
