@@ -23,7 +23,7 @@ LABEL_COLUMN = "label"
 def main():
     df = pd.read_csv(DATASET_PATH)
 
-    # Drop rows missing needed values
+    #drop rows that don't have some of the label cols
     df = df.dropna(subset=FEATURE_COLUMNS + [LABEL_COLUMN])
 
     #split into features and labels
