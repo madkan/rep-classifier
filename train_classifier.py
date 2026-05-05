@@ -155,6 +155,8 @@ def main():
 
     # Add baseline-relative features
     df = add_baseline_features(df, baseline_reps=3)
+    #drop rows that don't have some of the label cols
+    df = df.dropna(subset=FEATURE_COLUMNS + [LABEL_COLUMN])
 
     feature_columns = get_feature_columns()
 
