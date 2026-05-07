@@ -1,5 +1,6 @@
 import pandas as pd
 import joblib
+
 from sklearn.model_selection import GroupShuffleSplit, GroupKFold, GridSearchCV
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.pipeline import Pipeline
@@ -13,83 +14,49 @@ from sklearn.metrics import (
     recall_score,
 )
 
-DATASET_PATH = "rep_dataset_03.csv"
+DATASET_PATH = "rep_dataset_bicep_curls_features.csv"
 MODEL_PATH = "rep_classifier_bundle.pkl"
 
 LABEL_COLUMN = "label"
 GROUP_COLUMN = "set_id"
 
-BASE_FEATURE_COLUMNS = [
-    "duration",
-    "max_ay",
-    "min_ay",
-    "range_ay",
-    "mean_ay",
-    "std_ay",
-    "gyro_var",
+NEAR_FAILURE_THRESHOLD = 0.30
+THRESHOLDS_TO_TEST = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+
+COLUMNS_TO_EXCLUDE = [
+    LABEL_COLUMN,
+    GROUP_COLUMN,
+    "rep_id",
+    "start_time",
+    "end_time",
+    "segment_num_samples",
+    "segment_sampling_rate",
 ]
 
-BASELINE_SOURCE_COLUMNS = [
-    "duration",
-    "std_ay",
-    "gyro_var",
-    "range_ay",
-    "max_ay",
-]
+def should_exclude_feature(col):
+    if col in COLUMNS_TO_EXCLUDE:
+        return True
 
-LABEL_NAMES = {
-    0: "normal",
-    1: "near_failure",
-}
+    if col.startswith("baseline_"):
+        return True
 
-THRESHOLDS_TO_TEST = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+    return False
 
 
-def add_baseline_features(df, baseline_reps=3):
-    """
-    Adds baseline-relative features using the first few reps in each set.
+def get_feature_columns(df):
+    feature_columns = []
 
-    This is okay for real-time later because the first few reps happen before
-    the later reps we are trying to classify.
-    """
-    df = df.copy()
+    for col in df.columns:
+        if should_exclude_feature(col):
+            continue
 
-    for feature in BASELINE_SOURCE_COLUMNS:
-        baseline_col = f"baseline_{feature}"
-        ratio_col = f"{feature}_ratio_to_baseline"
-        diff_col = f"{feature}_diff_from_baseline"
+        if pd.api.types.is_numeric_dtype(df[col]):
+            feature_columns.append(col)
 
-        df[baseline_col] = df.groupby(GROUP_COLUMN)[feature].transform(
-            lambda x: x.iloc[:baseline_reps].mean()
-        )
-
-        df[ratio_col] = df[feature] / df[baseline_col]
-        df[diff_col] = df[feature] - df[baseline_col]
-
-    return df
-
-
-def get_feature_columns():
-    baseline_feature_columns = []
-
-    for feature in BASELINE_SOURCE_COLUMNS:
-        baseline_feature_columns.append(f"{feature}_ratio_to_baseline")
-        baseline_feature_columns.append(f"{feature}_diff_from_baseline")
-
-    return BASE_FEATURE_COLUMNS + baseline_feature_columns
+    return feature_columns
 
 
 def print_threshold_results(y_test, y_proba, thresholds):
-    """
-    Tests different probability thresholds for predicting near failure.
-
-    Lower threshold = more near-failure warnings, usually higher recall.
-    Higher threshold = fewer near-failure warnings, usually higher precision.
-    """
-    best_threshold = None
-    best_recall = -1
-    best_f1 = -1
-
     for threshold in thresholds:
         y_pred_thresholded = (y_proba >= threshold).astype(int)
 
@@ -131,37 +98,56 @@ def print_threshold_results(y_test, y_proba, thresholds):
         print("Confusion Matrix:")
         print(confusion_matrix(y_test, y_pred_thresholded, labels=[0, 1]))
 
-        # Choose threshold by highest near-failure recall,
-        # and break ties using near-failure F1.
-        if (
-            near_failure_recall > best_recall or
-            (near_failure_recall == best_recall and near_failure_f1 > best_f1)
-        ):
-            best_threshold = threshold
-            best_recall = near_failure_recall
-            best_f1 = near_failure_f1
+
+def print_chosen_threshold_results(y_test, y_proba, threshold):
+    y_pred_thresholded = (y_proba >= threshold).astype(int)
+
+    near_failure_precision = precision_score(
+        y_test,
+        y_pred_thresholded,
+        pos_label=1,
+        zero_division=0
+    )
+
+    near_failure_recall = recall_score(
+        y_test,
+        y_pred_thresholded,
+        pos_label=1,
+        zero_division=0
+    )
+
+    near_failure_f1 = f1_score(
+        y_test,
+        y_pred_thresholded,
+        pos_label=1,
+        zero_division=0
+    )
 
     print("\n" + "=" * 60)
-    print("Suggested threshold:")
-    print(best_threshold)
-    print(f"Near-failure recall at suggested threshold: {best_recall:.3f}")
-    print(f"Near-failure F1 at suggested threshold:     {best_f1:.3f}")
+    print(f"Chosen Threshold Results: {threshold}")
+    print("=" * 60)
+    print(f"Near-failure precision: {near_failure_precision:.3f}")
+    print(f"Near-failure recall:    {near_failure_recall:.3f}")
+    print(f"Near-failure F1:        {near_failure_f1:.3f}")
 
-    return best_threshold
+    print("\nClassification Report:")
+    print(classification_report(
+        y_test,
+        y_pred_thresholded,
+        target_names=["normal", "near_failure"],
+        zero_division=0
+    ))
+
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_test, y_pred_thresholded, labels=[0, 1]))
 
 
 def main():
     df = pd.read_csv(DATASET_PATH)
 
-    # Add baseline-relative features
-    df = add_baseline_features(df, baseline_reps=3)
-    #drop rows that don't have some of the label cols
-    df = df.dropna(subset=FEATURE_COLUMNS + [LABEL_COLUMN])
+    feature_columns = get_feature_columns(df)
 
-    feature_columns = get_feature_columns()
-
-    needed_columns = feature_columns + [LABEL_COLUMN, GROUP_COLUMN]
-    df = df.dropna(subset=needed_columns)
+    df = df.dropna(subset=[LABEL_COLUMN, GROUP_COLUMN])
 
     X = df[feature_columns]
     y = df[LABEL_COLUMN]
@@ -169,6 +155,9 @@ def main():
 
     print("Dataset shape:")
     print(df.shape)
+
+    print("\nNumber of features after filtering:")
+    print(len(feature_columns))
 
     print("\nFeature columns:")
     for col in feature_columns:
@@ -180,7 +169,6 @@ def main():
     print("\nSet counts:")
     print(groups.value_counts().sort_index())
 
-    # Split by set_id so reps from the same set stay together
     splitter = GroupShuffleSplit(
         n_splits=1,
         test_size=0.25,
@@ -217,7 +205,6 @@ def main():
         "model__class_weight": [None, "balanced"],
     }
 
-    # GroupKFold keeps whole sets together during cross-validation
     cv = GroupKFold(n_splits=5)
 
     grid_search = GridSearchCV(
@@ -239,48 +226,51 @@ def main():
 
     best_model = grid_search.best_estimator_
 
-    # Default prediction with model's built-in threshold of 0.5
-    y_pred = best_model.predict(X_test)
+    y_pred_default = best_model.predict(X_test)
 
     print("\n" + "=" * 60)
     print("Default Test Results")
     print("=" * 60)
 
     print("\nTest Accuracy:")
-    print(accuracy_score(y_test, y_pred))
+    print(accuracy_score(y_test, y_pred_default))
 
     print("\nTest F1 Score for Near Failure:")
-    print(f1_score(y_test, y_pred, pos_label=1, zero_division=0))
+    print(f1_score(y_test, y_pred_default, pos_label=1, zero_division=0))
 
     print("\nClassification Report:")
     print(classification_report(
         y_test,
-        y_pred,
+        y_pred_default,
         target_names=["normal", "near_failure"],
         zero_division=0
     ))
 
     print("Confusion Matrix:")
-    print(confusion_matrix(y_test, y_pred, labels=[0, 1]))
+    print(confusion_matrix(y_test, y_pred_default, labels=[0, 1]))
 
-    # Probability of near failure
     y_proba = best_model.predict_proba(X_test)[:, 1]
 
     print("\n" + "=" * 60)
     print("Threshold Testing")
     print("=" * 60)
 
-    best_threshold = print_threshold_results(
+    print_threshold_results(
         y_test=y_test,
         y_proba=y_proba,
         thresholds=THRESHOLDS_TO_TEST
     )
 
-    # Feature importances
+    print_chosen_threshold_results(
+        y_test=y_test,
+        y_proba=y_proba,
+        threshold=NEAR_FAILURE_THRESHOLD
+    )
+
     rf = best_model.named_steps["model"]
 
     print("\n" + "=" * 60)
-    print("Feature Importances")
+    print("Top Feature Importances")
     print("=" * 60)
 
     importances = sorted(
@@ -289,24 +279,21 @@ def main():
         reverse=True
     )
 
-    for feature, importance in importances:
+    for feature, importance in importances[:30]:
         print(f"{feature}: {importance:.4f}")
 
-    # Save model and metadata for real-time inference
     model_bundle = {
         "model": best_model,
         "feature_columns": feature_columns,
-        "base_feature_columns": BASE_FEATURE_COLUMNS,
-        "baseline_source_columns": BASELINE_SOURCE_COLUMNS,
-        "label_names": LABEL_NAMES,
-        "near_failure_threshold": best_threshold,
-        "baseline_reps": 3,
+        "near_failure_threshold": NEAR_FAILURE_THRESHOLD,
+        "columns_excluded": COLUMNS_TO_EXCLUDE,
     }
 
     joblib.dump(model_bundle, MODEL_PATH)
 
     print("\n" + "=" * 60)
     print(f"Saved model bundle to {MODEL_PATH}")
+    print(f"Saved near-failure threshold: {NEAR_FAILURE_THRESHOLD}")
     print("=" * 60)
 
 
