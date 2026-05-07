@@ -1,91 +1,301 @@
 import pandas as pd
 import joblib
-from sklearn.model_selection import train_test_split, GridSearchCV
+
+from sklearn.model_selection import GroupShuffleSplit, GroupKFold, GridSearchCV
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 
-DATASET_PATH = "rep_dataset.csv"
-MODEL_PATH = "rep_classifier.pkl"
-
-#adjust these to column names used in clean data csv
-FEATURE_COLUMNS = [
-    "rep_duration",
-    "peak_gyro_mag",
-    "mean_gyro_mag",
-    "gyro_range",
-    "accel_mag_std",
-    "duration_ratio_to_baseline",
-    "peak_ratio_to_baseline",
-]
+DATASET_PATH = "rep_dataset_bicep_curls_features.csv"
+MODEL_PATH = "rep_classifier_bundle.pkl"
 
 LABEL_COLUMN = "label"
+GROUP_COLUMN = "set_id"
+
+NEAR_FAILURE_THRESHOLD = 0.30
+THRESHOLDS_TO_TEST = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
+
+COLUMNS_TO_EXCLUDE = [
+    LABEL_COLUMN,
+    GROUP_COLUMN,
+    "rep_id",
+    "start_time",
+    "end_time",
+    "segment_num_samples",
+    "segment_sampling_rate",
+]
+
+def should_exclude_feature(col):
+    if col in COLUMNS_TO_EXCLUDE:
+        return True
+
+    if col.startswith("baseline_"):
+        return True
+
+    return False
+
+
+def get_feature_columns(df):
+    feature_columns = []
+
+    for col in df.columns:
+        if should_exclude_feature(col):
+            continue
+
+        if pd.api.types.is_numeric_dtype(df[col]):
+            feature_columns.append(col)
+
+    return feature_columns
+
+
+def print_threshold_results(y_test, y_proba, thresholds):
+    for threshold in thresholds:
+        y_pred_thresholded = (y_proba >= threshold).astype(int)
+
+        near_failure_precision = precision_score(
+            y_test,
+            y_pred_thresholded,
+            pos_label=1,
+            zero_division=0
+        )
+
+        near_failure_recall = recall_score(
+            y_test,
+            y_pred_thresholded,
+            pos_label=1,
+            zero_division=0
+        )
+
+        near_failure_f1 = f1_score(
+            y_test,
+            y_pred_thresholded,
+            pos_label=1,
+            zero_division=0
+        )
+
+        print("\n" + "=" * 60)
+        print(f"Threshold: {threshold}")
+        print(f"Near-failure precision: {near_failure_precision:.3f}")
+        print(f"Near-failure recall:    {near_failure_recall:.3f}")
+        print(f"Near-failure F1:        {near_failure_f1:.3f}")
+
+        print("\nClassification Report:")
+        print(classification_report(
+            y_test,
+            y_pred_thresholded,
+            target_names=["normal", "near_failure"],
+            zero_division=0
+        ))
+
+        print("Confusion Matrix:")
+        print(confusion_matrix(y_test, y_pred_thresholded, labels=[0, 1]))
+
+
+def print_chosen_threshold_results(y_test, y_proba, threshold):
+    y_pred_thresholded = (y_proba >= threshold).astype(int)
+
+    near_failure_precision = precision_score(
+        y_test,
+        y_pred_thresholded,
+        pos_label=1,
+        zero_division=0
+    )
+
+    near_failure_recall = recall_score(
+        y_test,
+        y_pred_thresholded,
+        pos_label=1,
+        zero_division=0
+    )
+
+    near_failure_f1 = f1_score(
+        y_test,
+        y_pred_thresholded,
+        pos_label=1,
+        zero_division=0
+    )
+
+    print("\n" + "=" * 60)
+    print(f"Chosen Threshold Results: {threshold}")
+    print("=" * 60)
+    print(f"Near-failure precision: {near_failure_precision:.3f}")
+    print(f"Near-failure recall:    {near_failure_recall:.3f}")
+    print(f"Near-failure F1:        {near_failure_f1:.3f}")
+
+    print("\nClassification Report:")
+    print(classification_report(
+        y_test,
+        y_pred_thresholded,
+        target_names=["normal", "near_failure"],
+        zero_division=0
+    ))
+
+    print("Confusion Matrix:")
+    print(confusion_matrix(y_test, y_pred_thresholded, labels=[0, 1]))
+
 
 def main():
     df = pd.read_csv(DATASET_PATH)
 
-    #drop rows that don't have some of the label cols
-    df = df.dropna(subset=FEATURE_COLUMNS + [LABEL_COLUMN])
+    feature_columns = get_feature_columns(df)
 
-    #split into features and labels
-    X = df[FEATURE_COLUMNS]
+    df = df.dropna(subset=[LABEL_COLUMN, GROUP_COLUMN])
+
+    X = df[feature_columns]
     y = df[LABEL_COLUMN]
+    groups = df[GROUP_COLUMN]
 
-    print("Class counts:")
+    print("Dataset shape:")
+    print(df.shape)
+
+    print("\nNumber of features after filtering:")
+    print(len(feature_columns))
+
+    print("\nFeature columns:")
+    for col in feature_columns:
+        print("-", col)
+
+    print("\nClass counts:")
     print(y.value_counts())
-    print()
 
-    #train/test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
-        random_state=42,
-        stratify=y
+    print("\nSet counts:")
+    print(groups.value_counts().sort_index())
+
+    splitter = GroupShuffleSplit(
+        n_splits=1,
+        test_size=0.25,
+        random_state=42
     )
 
-    rf_model = RandomForestClassifier(random_state=42)
+    train_idx, test_idx = next(splitter.split(X, y, groups))
 
-    #hyperparameter grid for grid search cv
+    X_train = X.iloc[train_idx]
+    X_test = X.iloc[test_idx]
+
+    y_train = y.iloc[train_idx]
+    y_test = y.iloc[test_idx]
+
+    train_groups = groups.iloc[train_idx]
+    test_groups = groups.iloc[test_idx]
+
+    print("\nTrain sets:")
+    print(sorted(train_groups.unique()))
+
+    print("\nTest sets:")
+    print(sorted(test_groups.unique()))
+
+    pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("model", RandomForestClassifier(random_state=42))
+    ])
+
     param_grid = {
-        "n_estimators": [50, 100, 200],
-        "max_depth": [3, 5, 10, None],
-        "min_samples_split": [2, 5, 10],
-        "min_samples_leaf": [1, 2, 4],
-        "class_weight": [None, "balanced"]
+        "model__n_estimators": [100, 200, 300],
+        "model__max_depth": [3, 5, 10, None],
+        "model__min_samples_split": [2, 5, 10],
+        "model__min_samples_leaf": [1, 2, 4],
+        "model__class_weight": [None, "balanced"],
     }
 
+    cv = GroupKFold(n_splits=5)
+
     grid_search = GridSearchCV(
-        estimator=rf_model,
+        estimator=pipeline,
         param_grid=param_grid,
-        cv=5,
-        scoring="f1_macro",
+        cv=cv,
+        scoring="f1",
         n_jobs=-1,
         verbose=2
     )
 
-    grid_search.fit(X_train, y_train)
+    grid_search.fit(X_train, y_train, groups=train_groups)
 
-    print("Best Parameters:")
+    print("\nBest Parameters:")
     print(grid_search.best_params_)
-    print()
-    print("Best CV Score:")
-    print(grid_search.best_score_)
-    print()
 
-    #choose the best model
+    print("\nBest CV F1 Score:")
+    print(grid_search.best_score_)
+
     best_model = grid_search.best_estimator_
 
-    #test predictions
-    y_pred = best_model.predict(X_test)
+    y_pred_default = best_model.predict(X_test)
 
-    print("Test Accuracy:")
-    print(accuracy_score(y_test, y_pred))
-    print()
-    print("Classification Report:")
-    print(classification_report(y_test, y_pred))
+    print("\n" + "=" * 60)
+    print("Default Test Results")
+    print("=" * 60)
+
+    print("\nTest Accuracy:")
+    print(accuracy_score(y_test, y_pred_default))
+
+    print("\nTest F1 Score for Near Failure:")
+    print(f1_score(y_test, y_pred_default, pos_label=1, zero_division=0))
+
+    print("\nClassification Report:")
+    print(classification_report(
+        y_test,
+        y_pred_default,
+        target_names=["normal", "near_failure"],
+        zero_division=0
+    ))
+
     print("Confusion Matrix:")
-    print(confusion_matrix(y_test, y_pred))
+    print(confusion_matrix(y_test, y_pred_default, labels=[0, 1]))
 
-    #save best model
-    joblib.dump(best_model, MODEL_PATH)
-    print(f"\nSaved model to {MODEL_PATH}")
+    y_proba = best_model.predict_proba(X_test)[:, 1]
+
+    print("\n" + "=" * 60)
+    print("Threshold Testing")
+    print("=" * 60)
+
+    print_threshold_results(
+        y_test=y_test,
+        y_proba=y_proba,
+        thresholds=THRESHOLDS_TO_TEST
+    )
+
+    print_chosen_threshold_results(
+        y_test=y_test,
+        y_proba=y_proba,
+        threshold=NEAR_FAILURE_THRESHOLD
+    )
+
+    rf = best_model.named_steps["model"]
+
+    print("\n" + "=" * 60)
+    print("Top Feature Importances")
+    print("=" * 60)
+
+    importances = sorted(
+        zip(feature_columns, rf.feature_importances_),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    for feature, importance in importances[:30]:
+        print(f"{feature}: {importance:.4f}")
+
+    model_bundle = {
+        "model": best_model,
+        "feature_columns": feature_columns,
+        "near_failure_threshold": NEAR_FAILURE_THRESHOLD,
+        "columns_excluded": COLUMNS_TO_EXCLUDE,
+    }
+
+    joblib.dump(model_bundle, MODEL_PATH)
+
+    print("\n" + "=" * 60)
+    print(f"Saved model bundle to {MODEL_PATH}")
+    print(f"Saved near-failure threshold: {NEAR_FAILURE_THRESHOLD}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
