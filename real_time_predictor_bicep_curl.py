@@ -1,4 +1,5 @@
 import argparse
+import re
 import threading
 import time
 
@@ -26,8 +27,8 @@ MIN_TIME_BETWEEN_CLASSIFIED_REPS = 0.80
 #first few reps are used to build baseline
 BASELINE_REPS = 3
 
-#if a detected segment is much longer than the baseline reps, skip it as it is probably the failure rep (still tuning this)
-MAX_DURATION_RATIO = 1.5
+#if a detected segment has a much smaller movement range than baseline, skip it because it is probably the failed rep
+MIN_RANGE_RATIO_ALLOWED = 0.70
 
 #valley/peak segmentation tuning
 VALLEY_PROMINENCE_FRAC = 0.20
@@ -46,19 +47,23 @@ REQUIRED_COLUMNS = [
 
 stop_requested = False
 
+
 def wait_for_stop_key():
     global stop_requested
     input("\nPress Enter again to end the set...\n")
     stop_requested = True
 
+
 def signal_magnitude(x, y, z):
     return np.sqrt(x**2 + y**2 + z**2)
+
 
 def safe_iqr(x):
     if len(x) == 0:
         return np.nan
 
     return np.percentile(x, 75) - np.percentile(x, 25)
+
 
 def time_domain_features(x, prefix):
     x = np.asarray(x, dtype=float)
@@ -131,7 +136,7 @@ def frequency_domain_features(x, fs, prefix):
     fft_magnitude = np.abs(fft_values)
     freqs = np.fft.rfftfreq(len(x), d=1 / fs)
 
-    #remove 0 Hz component
+    # remove 0 Hz component
     freqs = freqs[1:]
     fft_magnitude = fft_magnitude[1:]
 
@@ -243,7 +248,7 @@ def extract_rep_features(rep_df):
     feat["gyro_var"] = np.var(gx)
 
     #additional features
-    #not including raw "ay" here because max_ay/min_ay/range_ay/mean_ay/std_ay already represent the ay axis.
+    #not including raw "ay" because max_ay/min_ay/range_ay/mean_ay/std_ay are already in the dataset
     signals = {
         "ax": ax,
         "az": az,
@@ -332,24 +337,53 @@ def parse_serial_line(line):
     if not line:
         return None
 
-    if "t_us" in line or "ax_g" in line:
-        return None
-
     parts = line.split(",")
 
-    if len(parts) < 7:
+    if len(parts) >= 7:
+        try:
+            sample = {
+                "t_us": float(parts[0]),
+                "ax_g": float(parts[1]),
+                "ay_g": float(parts[2]),
+                "az_g": float(parts[3]),
+                "gx_dps": float(parts[4]),
+                "gy_dps": float(parts[5]),
+                "gz_dps": float(parts[6]),
+            }
+            sample["time_s"] = sample["t_us"] / 1_000_000.0
+            return sample
+        except ValueError:
+            pass
+
+    match = re.search(
+        r"\((\d+)\).*?"
+        r"AX:([-+]?\d*\.?\d+)\s+"
+        r"AY:([-+]?\d*\.?\d+)\s+"
+        r"AZ:([-+]?\d*\.?\d+).*?"
+        r"GX:([-+]?\d*\.?\d+)\s+"
+        r"GY:([-+]?\d*\.?\d+)\s+"
+        r"GZ:([-+]?\d*\.?\d+)",
+        line
+    )
+
+    if match is None:
         return None
 
     try:
+        #ESP-IDF timestamp is in milliseconds, so converting to microseconds
+        t_ms = float(match.group(1))
+        t_us = t_ms * 1000.0
+
         sample = {
-            "t_us": float(parts[0]),
-            "ax_g": float(parts[1]),
-            "ay_g": float(parts[2]),
-            "az_g": float(parts[3]),
-            "gx_dps": float(parts[4]),
-            "gy_dps": float(parts[5]),
-            "gz_dps": float(parts[6]),
+            "t_us": t_us,
+            "ax_g": float(match.group(2)),
+            "ay_g": float(match.group(3)),
+            "az_g": float(match.group(4)),
+            "gx_dps": float(match.group(5)),
+            "gy_dps": float(match.group(6)),
+            "gz_dps": float(match.group(7)),
         }
+
         sample["time_s"] = sample["t_us"] / 1_000_000.0
         return sample
 
@@ -500,7 +534,12 @@ def classify_rep(rep_df, rep_count, baseline_features, model, feature_columns, t
     return raw_features, pred, proba_near_failure
 
 
-def plot_detected_reps(buffer_df, detected_reps, title="Detected Reps"):
+def plot_detected_reps(
+    buffer_df,
+    detected_reps,
+    title="Detected Reps",
+    output_path="set_segmentation.png"
+):
     if len(buffer_df) == 0:
         print("No data to plot.")
         return
@@ -514,14 +553,16 @@ def plot_detected_reps(buffer_df, detected_reps, title="Detected Reps"):
     plt.plot(time_s, ay, alpha=0.35, label="Raw ay_g")
     plt.plot(time_s, smooth, linewidth=2, label="Smoothed ay_g")
 
-    for i, rep in enumerate(detected_reps, start=1):
+    counted_rep_num = 0
+
+    for segment_num, rep in enumerate(detected_reps, start=1):
         start_time = rep["start_time"]
         end_time = rep["end_time"]
         peak_time = rep.get("peak_time", None)
 
         prediction = rep.get("prediction", "unknown")
         probability = rep.get("probability", None)
-        duration_ratio = rep.get("duration_ratio", None)
+        range_ratio = rep.get("range_ratio", None)
 
         if prediction == "NEAR FAILURE":
             color = "red"
@@ -546,13 +587,17 @@ def plot_detected_reps(buffer_df, detected_reps, title="Detected Reps"):
         closest_idx = np.argmin(np.abs(time_s - mid_time))
         y_val = smooth[closest_idx]
 
-        label_text = str(i)
+        if prediction == "skipped":
+            label_text = "skip"
+        else:
+            counted_rep_num += 1
+            label_text = str(counted_rep_num)
 
         if probability is not None:
             label_text += f"\nP={probability:.2f}"
 
-        if duration_ratio is not None:
-            label_text += f"\nD={duration_ratio:.2f}"
+        if range_ratio is not None:
+            label_text += f"\nR={range_ratio:.2f}"
 
         plt.text(
             mid_time,
@@ -569,6 +614,10 @@ def plot_detected_reps(buffer_df, detected_reps, title="Detected Reps"):
     plt.ylabel("ay_g")
     plt.legend()
     plt.grid(True)
+
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
+    print(f"Saved set visualization to {output_path}")
+
     plt.show()
 
 
@@ -584,29 +633,31 @@ def load_model_bundle():
     return model, feature_columns, threshold
 
 
-def should_skip_long_rep(rep_df, baseline_features):
+def should_skip_small_range_rep(rep_df, baseline_features):
+    #skips reps where the ay_g movement range is much smaller than baseline, this helps reject failed reps that do not reach a full curl height
 
     if len(baseline_features) < BASELINE_REPS:
         return False, 1.0
 
-    duration = rep_df["time_s"].iloc[-1] - rep_df["time_s"].iloc[0]
+    ay = rep_df["ay_g"].values
+    current_range = np.max(ay) - np.min(ay)
 
-    baseline_durations = [
-        feat["duration"]
+    baseline_ranges = [
+        feat["range_ay"]
         for feat in baseline_features
-        if "duration" in feat and not pd.isna(feat["duration"])
+        if "range_ay" in feat and not pd.isna(feat["range_ay"])
     ]
 
-    if len(baseline_durations) == 0:
+    if len(baseline_ranges) == 0:
         return False, 1.0
 
-    baseline_duration = np.mean(baseline_durations)
-    duration_ratio = duration / (baseline_duration + 1e-8)
+    baseline_range = np.mean(baseline_ranges)
+    range_ratio = current_range / (baseline_range + 1e-8)
 
-    if duration_ratio > MAX_DURATION_RATIO:
-        return True, duration_ratio
+    if range_ratio < MIN_RANGE_RATIO_ALLOWED:
+        return True, range_ratio
 
-    return False, duration_ratio
+    return False, range_ratio
 
 
 def run_live_serial(port, baud, threshold_override=None):
@@ -663,24 +714,24 @@ def run_live_serial(port, baud, threshold_override=None):
                     if end_time <= last_classified_end_time + MIN_TIME_BETWEEN_CLASSIFIED_REPS:
                         continue
 
-                skip_long_rep, duration_ratio = should_skip_long_rep(
+                skip_small_range_rep, range_ratio = should_skip_small_range_rep(
                     rep_info["rep_df"],
                     baseline_features
                 )
 
-                if skip_long_rep:
+                if skip_small_range_rep:
                     print(
                         f"Skipping partial/failed rep attempt: "
-                        f"duration ratio={duration_ratio:.2f}"
+                        f"range ratio={range_ratio:.2f}"
                     )
 
                     detected_reps.append({
                         "start_time": rep_info["start_time"],
                         "end_time": rep_info["end_time"],
-                        "peak_time": None,
+                        "peak_time": buffer_df["time_s"].iloc[rep_info["peak_idx"]],
                         "prediction": "skipped",
                         "probability": None,
-                        "duration_ratio": duration_ratio,
+                        "range_ratio": range_ratio,
                     })
 
                     last_classified_end_time = end_time
@@ -712,21 +763,22 @@ def run_live_serial(port, baud, threshold_override=None):
                     "peak_time": buffer_df["time_s"].iloc[rep_info["peak_idx"]],
                     "prediction": prediction_label,
                     "probability": proba,
-                    "duration_ratio": duration_ratio,
+                    "range_ratio": range_ratio,
                 })
 
                 last_classified_end_time = end_time
 
         final_buffer_df = pd.DataFrame(buffer)
 
+        print("\nSet ended.")
+        print(f"Total reps detected: {rep_count}")
+
         plot_detected_reps(
             final_buffer_df,
             detected_reps,
-            title="Live Set Segmentation Check"
+            title="Live Set Segmentation Check",
+            output_path="live_set_segmentation.png"
         )
-
-        print("\nSet ended.")
-        print(f"Total reps detected: {rep_count}")
 
 
 def run_from_csv(csv_path, delay=0.01, threshold_override=None):
@@ -779,24 +831,24 @@ def run_from_csv(csv_path, delay=0.01, threshold_override=None):
                 if end_time <= last_classified_end_time + MIN_TIME_BETWEEN_CLASSIFIED_REPS:
                     continue
 
-            skip_long_rep, duration_ratio = should_skip_long_rep(
+            skip_small_range_rep, range_ratio = should_skip_small_range_rep(
                 rep_info["rep_df"],
                 baseline_features
             )
 
-            if skip_long_rep:
+            if skip_small_range_rep:
                 print(
                     f"Skipping partial/failed rep attempt: "
-                    f"duration ratio={duration_ratio:.2f}"
+                    f"range ratio={range_ratio:.2f}"
                 )
 
                 detected_reps.append({
                     "start_time": rep_info["start_time"],
                     "end_time": rep_info["end_time"],
-                    "peak_time": None,
+                    "peak_time": buffer_df["time_s"].iloc[rep_info["peak_idx"]],
                     "prediction": "skipped",
                     "probability": None,
-                    "duration_ratio": duration_ratio,
+                    "range_ratio": range_ratio,
                 })
 
                 last_classified_end_time = end_time
@@ -828,7 +880,7 @@ def run_from_csv(csv_path, delay=0.01, threshold_override=None):
                 "peak_time": buffer_df["time_s"].iloc[rep_info["peak_idx"]],
                 "prediction": prediction_label,
                 "probability": proba,
-                "duration_ratio": duration_ratio,
+                "range_ratio": range_ratio,
             })
 
             last_classified_end_time = end_time
@@ -837,14 +889,15 @@ def run_from_csv(csv_path, delay=0.01, threshold_override=None):
 
     final_buffer_df = pd.DataFrame(buffer)
 
+    print("\nReplay ended.")
+    print(f"Total reps detected: {rep_count}")
+
     plot_detected_reps(
         final_buffer_df,
         detected_reps,
-        title="Replay Segmentation Check"
+        title="Replay Segmentation Check",
+        output_path="replay_set_segmentation.png"
     )
-
-    print("\nReplay ended.")
-    print(f"Total reps detected: {rep_count}")
 
 
 def main():
