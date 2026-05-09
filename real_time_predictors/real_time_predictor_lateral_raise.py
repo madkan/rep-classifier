@@ -10,7 +10,7 @@ import pandas as pd
 from scipy.signal import find_peaks, butter, filtfilt
 
 
-MODEL_PATH = "lateral_raise_classifier_bundle.pkl"
+MODEL_PATH = "classifiers/lateral_raise_classifier_bundle.pkl"
 
 SIGNAL_COL = "az_g"
 
