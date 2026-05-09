@@ -10,7 +10,7 @@ import pandas as pd
 from scipy.signal import find_peaks
 
 
-MODEL_PATH = "rep_classifier_bundle.pkl"
+MODEL_PATH = "classifiers/rep_classifier_bundle.pkl"
 
 #rep segmentation settings
 MIN_REP_DURATION = 1.2

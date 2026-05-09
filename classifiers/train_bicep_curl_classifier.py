@@ -1,5 +1,6 @@
 import pandas as pd
 import joblib
+import matplotlib.pyplot as plt
 
 from sklearn.model_selection import GroupShuffleSplit, GroupKFold, GridSearchCV
 from sklearn.ensemble import RandomForestClassifier
@@ -14,27 +15,14 @@ from sklearn.metrics import (
     recall_score,
 )
 
-DATASET_PATH = "rep_dataset_lateral_raises_features.csv"
-MODEL_PATH = "lateral_raise_classifier_bundle.pkl"
+DATASET_PATH = "data/rep_dataset_bicep_curls_features.csv"
+MODEL_PATH = "classifiers/rep_classifier_bundle.pkl"
 
 LABEL_COLUMN = "label"
 GROUP_COLUMN = "set_id"
 
-# Start with the same threshold as bicep curls.
-# You can change this after seeing threshold testing results.
 NEAR_FAILURE_THRESHOLD = 0.30
-
-THRESHOLDS_TO_TEST = [
-    0.20,
-    0.25,
-    0.30,
-    0.35,
-    0.40,
-    0.45,
-    0.50,
-    0.55,
-    0.60,
-]
+THRESHOLDS_TO_TEST = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
 
 COLUMNS_TO_EXCLUDE = [
     LABEL_COLUMN,
@@ -51,8 +39,6 @@ def should_exclude_feature(col):
     if col in COLUMNS_TO_EXCLUDE:
         return True
 
-    # Exclude raw baseline columns because the ratio/diff columns
-    # usually contain the useful baseline-relative information.
     if col.startswith("baseline_"):
         return True
 
@@ -72,34 +58,44 @@ def get_feature_columns(df):
     return feature_columns
 
 
-def clean_labels(df):
-    """
-    Makes sure labels are numeric:
-    normal -> 0
-    near_failure -> 1
+def save_confusion_matrix_plot(y_true, y_pred, title, output_path):
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
 
-    If the labels are already 0/1, this leaves them alone.
-    """
+    fig, ax = plt.subplots(figsize=(6, 5))
 
-    df = df.copy()
+    im = ax.imshow(cm, cmap="Blues")
 
-    if df[LABEL_COLUMN].dtype == "object":
-        label_map = {
-            "normal": 0,
-            "near_failure": 1,
-            "near failure": 1,
-            "near-failure": 1,
-        }
+    ax.set_title(title)
+    ax.set_xlabel("Predicted Label")
+    ax.set_ylabel("True Label")
 
-        df[LABEL_COLUMN] = (
-            df[LABEL_COLUMN]
-            .astype(str)
-            .str.strip()
-            .str.lower()
-            .map(label_map)
-        )
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
 
-    return df
+    ax.set_xticklabels(["normal", "near_failure"])
+    ax.set_yticklabels(["normal", "near_failure"])
+
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            value = cm[i, j]
+            text_color = "white" if value > cm.max() / 2 else "black"
+
+            ax.text(
+                j,
+                i,
+                str(value),
+                ha="center",
+                va="center",
+                color=text_color,
+                fontsize=16,
+                fontweight="bold"
+            )
+
+    fig.colorbar(im, ax=ax)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
+    print(f"Saved confusion matrix plot to {output_path}")
+    plt.close()
 
 
 def print_threshold_results(y_test, y_proba, thresholds):
@@ -187,18 +183,20 @@ def print_chosen_threshold_results(y_test, y_proba, threshold):
     print("Confusion Matrix:")
     print(confusion_matrix(y_test, y_pred_thresholded, labels=[0, 1]))
 
+    save_confusion_matrix_plot(
+        y_true=y_test,
+        y_pred=y_pred_thresholded,
+        title=f"Bicep Curl Confusion Matrix - Threshold {threshold}",
+        output_path=f"bicep_confusion_matrix_threshold_{threshold}.png"
+    )
+
 
 def main():
     df = pd.read_csv(DATASET_PATH)
 
-    df = clean_labels(df)
+    feature_columns = get_feature_columns(df)
 
     df = df.dropna(subset=[LABEL_COLUMN, GROUP_COLUMN])
-
-    # Make sure labels are integers after cleaning
-    df[LABEL_COLUMN] = df[LABEL_COLUMN].astype(int)
-
-    feature_columns = get_feature_columns(df)
 
     X = df[feature_columns]
     y = df[LABEL_COLUMN]
@@ -256,16 +254,7 @@ def main():
         "model__class_weight": [None, "balanced"],
     }
 
-    num_train_groups = train_groups.nunique()
-    num_splits = min(5, num_train_groups)
-
-    if num_splits < 2:
-        raise ValueError(
-            "Not enough training groups for GroupKFold. "
-            "Need at least 2 unique set_id values in training data."
-        )
-
-    cv = GroupKFold(n_splits=num_splits)
+    cv = GroupKFold(n_splits=5)
 
     grid_search = GridSearchCV(
         estimator=pipeline,
@@ -309,6 +298,13 @@ def main():
     print("Confusion Matrix:")
     print(confusion_matrix(y_test, y_pred_default, labels=[0, 1]))
 
+    save_confusion_matrix_plot(
+        y_true=y_test,
+        y_pred=y_pred_default,
+        title="Bicep Curl Confusion Matrix - Default Threshold",
+        output_path="bicep_confusion_matrix_default.png"
+    )
+
     y_proba = best_model.predict_proba(X_test)[:, 1]
 
     print("\n" + "=" * 60)
@@ -347,8 +343,6 @@ def main():
         "feature_columns": feature_columns,
         "near_failure_threshold": NEAR_FAILURE_THRESHOLD,
         "columns_excluded": COLUMNS_TO_EXCLUDE,
-        "exercise": "lateral_raise",
-        "dataset_path": DATASET_PATH,
     }
 
     joblib.dump(model_bundle, MODEL_PATH)
